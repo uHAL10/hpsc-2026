@@ -1,6 +1,6 @@
 # hpc_lecture
 
-Student ID:
+Student ID: [redacted]
 
 |          | Topic                                | Sample code               |
 | -------- | ------------------------------------ | ------------------------- |
