@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <omp.h>
 
 int main() {
   int n = 50;
@@ -12,12 +13,25 @@ int main() {
   }
   printf("\n");
 
-  std::vector<int> bucket(range,0); 
-  for (int i=0; i<n; i++)
+  std::vector<int> bucket(range,0);
+#pragma omp parallel for
+  for (int i=0; i<n; i++) {
+#pragma omp atomic
     bucket[key[i]]++;
-  std::vector<int> offset(range,0);
-  for (int i=1; i<range; i++) 
-    offset[i] = offset[i-1] + bucket[i-1];
+  }
+
+  // Hillis-Steele parallel prefix sum (inclusive → exclusive)
+  std::vector<int> offset(bucket), tmp(range);
+  for (int step=1; step<range; step*=2) {
+#pragma omp parallel for
+    for (int i=0; i<range; i++)
+      tmp[i] = offset[i] + (i>=step ? offset[i-step] : 0);
+    std::swap(offset, tmp);
+  }
+  for (int i=range-1; i>0; i--) offset[i] = offset[i-1];
+  offset[0] = 0;
+
+#pragma omp parallel for
   for (int i=0; i<range; i++) {
     int j = offset[i];
     for (; bucket[i]>0; bucket[i]--) {
