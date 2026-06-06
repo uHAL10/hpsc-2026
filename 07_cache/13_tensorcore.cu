@@ -20,7 +20,7 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   constexpr int tile_k = 64;
   constexpr int skew = 8;
   constexpr int stride_m = tile_m + skew;
-  constexpr int stride_n = tile_n + skew;
+  constexpr int stride_k = tile_k + skew;
   int offset_a_m = tile_m * blockIdx.x;
   int offset_b_n = tile_n * blockIdx.y;
   int warp_id = threadIdx.x / 32;
@@ -28,7 +28,7 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   int warp_n = warp_id >> 2;
 
   __shared__ half block_a[tile_k][stride_m];
-  __shared__ half block_b[tile_k][stride_n];
+  __shared__ half block_b[tile_n][stride_k];
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
   #pragma unroll
@@ -49,16 +49,16 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     for (int idx = threadIdx.x; idx < tile_k * tile_n; idx += 256) {
       int col = idx / tile_k;
       int row = idx - col * tile_k;
-      block_b[row][col] = d_b[(offset_b_n + col) * dim_k + k + row];
+      block_b[col][row] = d_b[(offset_b_n + col) * dim_k + k + row];
     }
     __syncthreads();
 
     #pragma unroll
     for (int kk = 0; kk < tile_k; kk += 16) {
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag[4];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag[4];
       #pragma unroll
       for (int c = 0; c < 4; c++) {
-        wmma::load_matrix_sync(b_frag[c], &block_b[kk][(warp_n * 4 + c) * 16], stride_n);
+        wmma::load_matrix_sync(b_frag[c], &block_b[(warp_n * 4 + c) * 16][kk], stride_k);
       }
 
       #pragma unroll
