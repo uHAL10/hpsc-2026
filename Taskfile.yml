@@ -1,0 +1,14 @@
+version: '3'
+
+dotenv:
+  - .env
+
+tasks:
+  cache:run:
+    cmds:
+      - git push
+      - |
+        ssh tsubame "cd /gs/fs/${TSUBAME_GROUP}/${TSUBAME_USER}/hpsc-2026/07_cache/ \
+        && git pull \
+        && qsub -g ${TSUBAME_GROUP} -sync y job.sh \
+        && cat output.txt"

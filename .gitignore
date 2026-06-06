@@ -1,3 +1,4 @@
 .direnv
+.env
 .envrc
 .mise/bin/
