@@ -6,7 +6,6 @@ dotenv:
 tasks:
   cache:run:
     cmds:
-      - git push
       - |
         ssh tsubame "cd /gs/fs/${TSUBAME_GROUP}/${TSUBAME_USER}/hpsc-2026/07_cache/ \
         && git pull \
