@@ -8,9 +8,14 @@
 using namespace std;
 using namespace nvcuda;
 
+__global__ void convert_to_half(int64_t size, const float *src, half *dst) {
+  int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < size) dst[i] = __float2half(src[i]);
+}
+
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
-		       float *d_a, float *d_b, float *d_c) {
-  constexpr int tile_m = 64;
+		       half *d_a, half *d_b, float *d_c) {
+  constexpr int tile_m = 128;
   constexpr int tile_n = 64;
   int offset_a_m = tile_m * blockIdx.x;
   int offset_b_n = tile_n * blockIdx.y;
@@ -19,10 +24,12 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   __shared__ half block_a[16][tile_m];
   __shared__ half block_b[16][tile_n];
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
   #pragma unroll
-  for (int c = 0; c < 4; c++)
-    wmma::fill_fragment(acc[c], 0.0f);
+  for (int r = 0; r < 2; r++)
+    #pragma unroll
+    for (int c = 0; c < 4; c++)
+      wmma::fill_fragment(acc[r][c], 0.0f);
 
   for (int k = 0; k < dim_k; k += 16) {
     __syncthreads();
@@ -30,30 +37,37 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     for (int idx = threadIdx.x; idx < 16 * tile_m; idx += 128) {
       int row = idx / tile_m;
       int col = idx - row * tile_m;
-      block_a[row][col] = __float2half(d_a[(k + row) * dim_m + offset_a_m + col]);
+      block_a[row][col] = d_a[(k + row) * dim_m + offset_a_m + col];
     }
     #pragma unroll
     for (int idx = threadIdx.x; idx < 16 * tile_n; idx += 128) {
       int row = idx / tile_n;
       int col = idx - row * tile_n;
-      block_b[row][col] = __float2half(d_b[(offset_b_n + col) * dim_k + k + row]);
+      block_b[row][col] = d_b[(offset_b_n + col) * dim_k + k + row];
     }
     __syncthreads();
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-    wmma::load_matrix_sync(a_frag, &block_a[0][warp_id * 16], tile_m);
     #pragma unroll
-    for (int c = 0; c < 4; c++) {
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-      wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], tile_n);
-      wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
+    for (int r = 0; r < 2; r++) {
+      int row_tile = warp_id * 2 + r;
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+      wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], tile_m);
+      #pragma unroll
+      for (int c = 0; c < 4; c++) {
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+        wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], tile_n);
+        wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
+      }
     }
   }
   #pragma unroll
-  for (int c = 0; c < 4; c++) {
-    int c_m = offset_a_m + warp_id * 16;
-    int c_n = offset_b_n + c * 16;
-    if (c_n < dim_n && c_m < dim_m)
-      wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[c], dim_m, wmma::mem_col_major);
+  for (int r = 0; r < 2; r++) {
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+      int c_m = offset_a_m + (warp_id * 2 + r) * 16;
+      int c_n = offset_b_n + c * 16;
+      if (c_n < dim_n && c_m < dim_m)
+        wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
+    }
   }
 }
 
@@ -65,10 +79,13 @@ int main(int argc, const char **argv) {
   float beta = 0.0;
   int Nt = 10;
   float *A, *B, *C, *C2;
+  half *Ah, *Bh;
   cudaMallocManaged(&A, m * k * sizeof(float));
   cudaMallocManaged(&B, k * n * sizeof(float));
   cudaMallocManaged(&C, m * n * sizeof(float));
   cudaMallocManaged(&C2, m * n * sizeof(float));
+  cudaMallocManaged(&Ah, m * k * sizeof(half));
+  cudaMallocManaged(&Bh, k * n * sizeof(half));
   for (int i=0; i<m; i++)
     for (int j=0; j<k; j++)
       A[k*i+j] = drand48();
@@ -78,6 +95,10 @@ int main(int argc, const char **argv) {
   for (int i=0; i<n; i++)
     for (int j=0; j<m; j++)
       C[m*i+j] = C2[m*i+j] = 0;
+  int conv_block = 256;
+  convert_to_half<<<(int64_t(m) * k + conv_block - 1) / conv_block, conv_block>>>(int64_t(m) * k, A, Ah);
+  convert_to_half<<<(int64_t(k) * n + conv_block - 1) / conv_block, conv_block>>>(int64_t(k) * n, B, Bh);
+  cudaDeviceSynchronize();
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
   auto tic = chrono::steady_clock::now();
@@ -102,7 +123,7 @@ int main(int argc, const char **argv) {
   int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
-  int tile_m = 64;
+  int tile_m = 128;
   int tile_n = 64;
   dim3 block = dim3(128);
   dim3 grid = dim3((m+tile_m-1)/tile_m, (n+tile_n-1)/tile_n);
@@ -111,8 +132,8 @@ int main(int argc, const char **argv) {
     kernel<<< grid, block >>>(m,
 			      n,
 			      k,
-			      A,
-			      B,
+			      Ah,
+			      Bh,
 			      C2);
     cudaDeviceSynchronize();
   }
@@ -129,6 +150,8 @@ int main(int argc, const char **argv) {
   printf("error: %lf\n", err/n/m);
   cudaFree(A);
   cudaFree(B);
+  cudaFree(Ah);
+  cudaFree(Bh);
   cudaFree(C);
   cudaFree(C2);
   cublasDestroy(cublas_handle);
