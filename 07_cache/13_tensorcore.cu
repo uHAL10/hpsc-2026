@@ -24,29 +24,27 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   int offset_a_m = tile_m * blockIdx.x;
   int offset_b_n = tile_n * blockIdx.y;
   int warp_id = threadIdx.x / 32;
-  int warp_m = warp_id & 3;
-  int warp_n = warp_id >> 2;
+  int warp_m = warp_id & 7;
+  int warp_n = warp_id >> 3;
 
   __shared__ half block_a[tile_k][stride_m];
   __shared__ half block_b[tile_n][stride_k];
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
   #pragma unroll
-  for (int r = 0; r < 2; r++)
-    #pragma unroll
-    for (int c = 0; c < 4; c++)
-      wmma::fill_fragment(acc[r][c], 0.0f);
+  for (int c = 0; c < 4; c++)
+    wmma::fill_fragment(acc[c], 0.0f);
 
   for (int k = 0; k < dim_k; k += tile_k) {
     __syncthreads();
     #pragma unroll
-    for (int idx = threadIdx.x; idx < tile_k * tile_m; idx += 256) {
+    for (int idx = threadIdx.x; idx < tile_k * tile_m; idx += 512) {
       int row = idx / tile_m;
       int col = idx - row * tile_m;
       block_a[row][col] = d_a[(k + row) * dim_m + offset_a_m + col];
     }
     #pragma unroll
-    for (int idx = threadIdx.x; idx < tile_k * tile_n; idx += 256) {
+    for (int idx = threadIdx.x; idx < tile_k * tile_n; idx += 512) {
       int col = idx / tile_k;
       int row = idx - col * tile_k;
       block_b[col][row] = d_b[(offset_b_n + col) * dim_k + k + row];
@@ -61,27 +59,20 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
         wmma::load_matrix_sync(b_frag[c], &block_b[(warp_n * 4 + c) * 16][kk], stride_k);
       }
 
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+      wmma::load_matrix_sync(a_frag, &block_a[kk][warp_m * 16], stride_m);
       #pragma unroll
-      for (int r = 0; r < 2; r++) {
-        int row_tile = warp_m * 2 + r;
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-        wmma::load_matrix_sync(a_frag, &block_a[kk][row_tile * 16], stride_m);
-        #pragma unroll
-        for (int c = 0; c < 4; c++) {
-          wmma::mma_sync(acc[r][c], a_frag, b_frag[c], acc[r][c]);
-        }
+      for (int c = 0; c < 4; c++) {
+        wmma::mma_sync(acc[c], a_frag, b_frag[c], acc[c]);
       }
     }
   }
   #pragma unroll
-  for (int r = 0; r < 2; r++) {
-    #pragma unroll
-    for (int c = 0; c < 4; c++) {
-      int c_m = offset_a_m + (warp_m * 2 + r) * 16;
-      int c_n = offset_b_n + (warp_n * 4 + c) * 16;
-      if (c_n < dim_n && c_m < dim_m)
-        wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
-    }
+  for (int c = 0; c < 4; c++) {
+    int c_m = offset_a_m + warp_m * 16;
+    int c_n = offset_b_n + (warp_n * 4 + c) * 16;
+    if (c_n < dim_n && c_m < dim_m)
+      wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[c], dim_m, wmma::mem_col_major);
   }
 }
 
@@ -139,7 +130,7 @@ int main(int argc, const char **argv) {
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
   int tile_m = 128;
   int tile_n = 128;
-  dim3 block = dim3(256);
+  dim3 block = dim3(512);
   dim3 grid = dim3((m+tile_m-1)/tile_m, (n+tile_n-1)/tile_n);
   for (int i = 0; i < Nt+2; i++) {
     if (i == 2) tic = chrono::steady_clock::now();
