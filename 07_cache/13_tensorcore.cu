@@ -46,8 +46,8 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     }
     #pragma unroll
     for (int idx = threadIdx.x; idx < 16 * tile_n; idx += 256) {
-      int row = idx / tile_n;
-      int col = idx - row * tile_n;
+      int col = idx / 16;
+      int row = idx - col * 16;
       block_b[row][col] = d_b[(offset_b_n + col) * dim_k + k + row];
     }
     __syncthreads();
