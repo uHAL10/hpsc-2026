@@ -17,7 +17,7 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
 		       half *d_a, half *d_b, float *d_c) {
   constexpr int tile_m = 128;
   constexpr int tile_n = 128;
-  constexpr int tile_k = 32;
+  constexpr int tile_k = 64;
   constexpr int skew = 8;
   constexpr int stride_m = tile_m + skew;
   constexpr int stride_n = tile_n + skew;
