@@ -13,12 +13,12 @@ __global__ void convert_to_half(int64_t size, const float *src, half *dst) {
   if (i < size) dst[i] = __float2half(src[i]);
 }
 
-__global__ void kernel(int dim_m, int dim_n, int dim_k,
+__launch_bounds__(256, 2) __global__ void kernel(int dim_m, int dim_n, int dim_k,
 		       half *d_a, half *d_b, float *d_c) {
   constexpr int tile_m = 128;
   constexpr int tile_n = 128;
   constexpr int tile_k = 64;
-  constexpr int skew = 16;
+  constexpr int skew = 8;
   constexpr int stride_m = tile_m + skew;
   constexpr int stride_n = tile_n + skew;
   int offset_a_m = tile_m * blockIdx.x;
