@@ -26,10 +26,10 @@ __device__ __forceinline__ void cp_async_wait_all() {
   asm volatile("cp.async.wait_all;");
 }
 
-__global__ __launch_bounds__(256, 1)
+__global__ __launch_bounds__(256, 2)
 void kernel(int dim_m, int dim_n, int dim_k,
             half *d_a, half *d_b, float *d_c) {
-  constexpr int tile_m = 256;
+  constexpr int tile_m = 128;
   constexpr int tile_n = 128;
   constexpr int tile_k = 64;
   constexpr int skew = 8;
@@ -46,9 +46,9 @@ void kernel(int dim_m, int dim_n, int dim_k,
 
   extern __shared__ half smem[];
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][4];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
   #pragma unroll
-  for (int r = 0; r < 4; r++)
+  for (int r = 0; r < 2; r++)
     #pragma unroll
     for (int c = 0; c < 4; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
@@ -111,9 +111,9 @@ void kernel(int dim_m, int dim_n, int dim_k,
         wmma::load_matrix_sync(b_frag[c], &cb[(warp_n * 4 + c) * 16 * stride_k + kk], stride_k);
       }
       #pragma unroll
-      for (int r = 0; r < 4; r++) {
+      for (int r = 0; r < 2; r++) {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-        wmma::load_matrix_sync(a_frag, &ca[kk * stride_m + (warp_m * 4 + r) * 16], stride_m);
+        wmma::load_matrix_sync(a_frag, &ca[kk * stride_m + (warp_m * 2 + r) * 16], stride_m);
         #pragma unroll
         for (int c = 0; c < 4; c++) {
           wmma::mma_sync(acc[r][c], a_frag, b_frag[c], acc[r][c]);
@@ -129,10 +129,10 @@ void kernel(int dim_m, int dim_n, int dim_k,
   }
 
   #pragma unroll
-  for (int r = 0; r < 4; r++) {
+  for (int r = 0; r < 2; r++) {
     #pragma unroll
     for (int c = 0; c < 4; c++) {
-      int c_m = offset_a_m + (warp_m * 4 + r) * 16;
+      int c_m = offset_a_m + (warp_m * 2 + r) * 16;
       int c_n = offset_b_n + (warp_n * 4 + c) * 16;
       if (c_n < dim_n && c_m < dim_m)
         wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
@@ -192,7 +192,7 @@ int main(int argc, const char **argv) {
   int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
-  constexpr int tile_m = 256;
+  constexpr int tile_m = 128;
   constexpr int tile_n = 128;
   constexpr int tile_k = 64;
   constexpr int skew = 8;
