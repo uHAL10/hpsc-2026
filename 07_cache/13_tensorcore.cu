@@ -13,22 +13,38 @@ __global__ void convert_to_half(int64_t size, const float *src, half *dst) {
   if (i < size) dst[i] = __float2half(src[i]);
 }
 
-__global__ void kernel(int dim_m, int dim_n, int dim_k,
-		       half *d_a, half *d_b, float *d_c) {
+__device__ __forceinline__ void cp_async16(void *smem, const void *gmem) {
+  unsigned addr = __cvta_generic_to_shared(smem);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(addr), "l"(gmem));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+  asm volatile("cp.async.commit_group;");
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+  asm volatile("cp.async.wait_all;");
+}
+
+__global__ __launch_bounds__(256, 2)
+void kernel(int dim_m, int dim_n, int dim_k,
+            half *d_a, half *d_b, float *d_c) {
   constexpr int tile_m = 128;
   constexpr int tile_n = 128;
   constexpr int tile_k = 64;
   constexpr int skew = 8;
   constexpr int stride_m = tile_m + skew;
   constexpr int stride_k = tile_k + skew;
+  constexpr int a_buf_size = tile_k * stride_m;
+  constexpr int b_buf_size = tile_n * stride_k;
+  constexpr int b_offset = 2 * a_buf_size;
   int offset_a_m = tile_m * blockIdx.x;
   int offset_b_n = tile_n * blockIdx.y;
   int warp_id = threadIdx.x / 32;
   int warp_m = warp_id & 3;
   int warp_n = warp_id >> 2;
 
-  __shared__ half block_a[tile_k][stride_m];
-  __shared__ half block_b[tile_n][stride_k];
+  extern __shared__ half smem[];
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
   #pragma unroll
@@ -37,44 +53,81 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     for (int c = 0; c < 4; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
-  for (int k = 0; k < dim_k; k += tile_k) {
-    __syncthreads();
+  {
+    half *ba = smem;
+    half *bb = smem + b_offset;
     #pragma unroll
     for (int idx = threadIdx.x; idx < tile_k * (tile_m / 8); idx += 256) {
       int row = idx / (tile_m / 8);
       int vec = idx - row * (tile_m / 8);
-      reinterpret_cast<int4 *>(&block_a[row][vec * 8])[0] =
-          reinterpret_cast<const int4 *>(&d_a[(k + row) * dim_m + offset_a_m + vec * 8])[0];
+      cp_async16(&ba[row * stride_m + vec * 8],
+                  &d_a[row * dim_m + offset_a_m + vec * 8]);
     }
     #pragma unroll
     for (int idx = threadIdx.x; idx < tile_n * (tile_k / 8); idx += 256) {
       int col = idx / (tile_k / 8);
       int vec = idx - col * (tile_k / 8);
-      reinterpret_cast<int4 *>(&block_b[col][vec * 8])[0] =
-          reinterpret_cast<const int4 *>(&d_b[(offset_b_n + col) * dim_k + k + vec * 8])[0];
+      cp_async16(&bb[col * stride_k + vec * 8],
+                  &d_b[(offset_b_n + col) * dim_k + vec * 8]);
     }
+    cp_async_commit();
+    cp_async_wait_all();
     __syncthreads();
+  }
+
+  int buf = 0;
+  for (int k = 0; k < dim_k; k += tile_k) {
+    int next_k = k + tile_k;
+    int next_buf = 1 - buf;
+
+    if (next_k < dim_k) {
+      half *na = smem + next_buf * a_buf_size;
+      half *nb = smem + b_offset + next_buf * b_buf_size;
+      #pragma unroll
+      for (int idx = threadIdx.x; idx < tile_k * (tile_m / 8); idx += 256) {
+        int row = idx / (tile_m / 8);
+        int vec = idx - row * (tile_m / 8);
+        cp_async16(&na[row * stride_m + vec * 8],
+                    &d_a[(next_k + row) * dim_m + offset_a_m + vec * 8]);
+      }
+      #pragma unroll
+      for (int idx = threadIdx.x; idx < tile_n * (tile_k / 8); idx += 256) {
+        int col = idx / (tile_k / 8);
+        int vec = idx - col * (tile_k / 8);
+        cp_async16(&nb[col * stride_k + vec * 8],
+                    &d_b[(offset_b_n + col) * dim_k + next_k + vec * 8]);
+      }
+      cp_async_commit();
+    }
+
+    half *ca = smem + buf * a_buf_size;
+    half *cb = smem + b_offset + buf * b_buf_size;
 
     #pragma unroll
     for (int kk = 0; kk < tile_k; kk += 16) {
       wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag[4];
       #pragma unroll
       for (int c = 0; c < 4; c++) {
-        wmma::load_matrix_sync(b_frag[c], &block_b[(warp_n * 4 + c) * 16][kk], stride_k);
+        wmma::load_matrix_sync(b_frag[c], &cb[(warp_n * 4 + c) * 16 * stride_k + kk], stride_k);
       }
-
       #pragma unroll
       for (int r = 0; r < 2; r++) {
-        int row_tile = warp_m * 2 + r;
         wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-        wmma::load_matrix_sync(a_frag, &block_a[kk][row_tile * 16], stride_m);
+        wmma::load_matrix_sync(a_frag, &ca[kk * stride_m + (warp_m * 2 + r) * 16], stride_m);
         #pragma unroll
         for (int c = 0; c < 4; c++) {
           wmma::mma_sync(acc[r][c], a_frag, b_frag[c], acc[r][c]);
         }
       }
     }
+
+    if (next_k < dim_k) {
+      cp_async_wait_all();
+    }
+    __syncthreads();
+    buf = next_buf;
   }
+
   #pragma unroll
   for (int r = 0; r < 2; r++) {
     #pragma unroll
@@ -139,13 +192,19 @@ int main(int argc, const char **argv) {
   int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
-  int tile_m = 128;
-  int tile_n = 128;
+  constexpr int tile_m = 128;
+  constexpr int tile_n = 128;
+  constexpr int tile_k = 64;
+  constexpr int skew = 8;
+  constexpr int stride_m = tile_m + skew;
+  constexpr int stride_k = tile_k + skew;
+  constexpr int smem_bytes = (2 * tile_k * stride_m + 2 * tile_n * stride_k) * (int)sizeof(half);
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
   dim3 block = dim3(256);
   dim3 grid = dim3((m+tile_m-1)/tile_m, (n+tile_n-1)/tile_n);
   for (int i = 0; i < Nt+2; i++) {
     if (i == 2) tic = chrono::steady_clock::now();
-    kernel<<< grid, block >>>(m,
+    kernel<<< grid, block, smem_bytes >>>(m,
 			      n,
 			      k,
 			      Ah,
